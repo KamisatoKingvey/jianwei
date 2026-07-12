@@ -8,8 +8,9 @@ COPY pyproject.toml ./
 COPY src ./src
 COPY static ./static
 
+# 腾讯云镜像源加速云托管构建（claude-agent-sdk 体积较大）
 RUN mkdir -p data \
-    && pip install --no-cache-dir .
+    && pip install --no-cache-dir -i https://mirrors.cloud.tencent.com/pypi/simple .
 
 EXPOSE 80
 

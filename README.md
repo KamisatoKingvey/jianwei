@@ -81,6 +81,28 @@ WX_SUBSCRIBE_TIME_KEY        # 模板时间字段名，默认 time2
 WX_SUBSCRIBE_PAGE            # 点击消息跳转页，默认 pages/dashboard/dashboard
 ```
 
+## 见微睡眠助手（agent）
+
+基于 claude-agent-sdk（官方 harness，内置系统提示词原样保留、仅 append 见微约束），
+模型走 Anthropic 兼容协议，默认指向 MiniMax：
+
+```text
+LLM_API_KEY                  # 必填，不配则助手整体禁用（503），核心功能不受影响
+LLM_BASE_URL                 # 默认 https://api.minimaxi.com/anthropic
+LLM_MODEL                    # 默认 MiniMax-M3
+JIANWEI_AGENT_DAILY_LIMIT    # 每用户每日对话上限，默认 30
+JIANWEI_AGENT_MAX_TURNS      # agent 单次最大轮数，默认 8
+```
+
+接口：
+
+- `POST /api/agent/chat` — 多轮对话（openid 走 callContainer 注入；回复末尾强制拼接免责声明）
+- `GET /api/agent/conversations/{id}` — 拉取对话历史（仅本人）
+- `GET /api/agent/report-insights/{device_id}` — 晨报 AI 解读，按会话缓存；agent 不可用时回落规则摘要
+
+agent 只有 5 个只读数据工具（设备列表/最新报告/多晚趋势/实时状态/告警），
+全部按 openid 校验设备归属；内置 Bash/文件读写等工具全部禁用。
+
 本地未配置 MySQL 时，采样/设备/告警分别落在 `data/samples.jsonl`、`data/devices.json`、`data/alerts.jsonl`；配置 MySQL 后自动建表 `radar_samples`、`devices`、`user_devices`、`alerts`。
 
 ## 测试
