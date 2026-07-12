@@ -4,11 +4,13 @@ version = "0.1.0"
 description = "Jianwei sleep-breathing radar backend MVP"
 requires-python = ">=3.11"
 dependencies = [
-  "fastapi>=0.115.0",
+  # claude-agent-sdk 依赖的 mcp 会把 starlette 拉到 1.x，
+  # 而 fastapi <0.121 只兼容 starlette <0.42，必须一起提上来
+  "fastapi>=0.121.0",
   "uvicorn[standard]>=0.30.0",
   "pydantic>=2.8.0",
   "PyMySQL>=1.1.1",
-  "claude-agent-sdk>=0.1.0"
+  "claude-agent-sdk>=0.2.0"
 ]
 
 [project.optional-dependencies]

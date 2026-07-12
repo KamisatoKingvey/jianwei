@@ -13,7 +13,12 @@ from jianwei.storage.sample_store import JsonlSampleStore
 
 client = TestClient(main.app)
 
-OPENID_HEADER = {"X-WX-OPENID": "openid-1"}
+OPENID_HEADER = {"X-WX-OPENID": "openid-1", "X-WX-SOURCE": "wxcloud"}
+
+
+def wx_headers(openid):
+    """模拟云托管 callContainer 注入的可信头。"""
+    return {"X-WX-OPENID": openid, "X-WX-SOURCE": "wxcloud"}
 
 
 class FakeRunner:
@@ -124,7 +129,7 @@ def test_chat_rejects_foreign_conversation():
     response = client.post(
         "/api/agent/chat",
         json={"message": "hack", "conversation_id": mine["conversation_id"]},
-        headers={"X-WX-OPENID": "openid-2"},
+        headers=wx_headers("openid-2"),
     )
 
     assert response.status_code == 403
@@ -145,7 +150,7 @@ def test_conversation_history_endpoint_enforces_ownership():
     cid = mine["conversation_id"]
 
     ok = client.get(f"/api/agent/conversations/{cid}", headers=OPENID_HEADER)
-    forbidden = client.get(f"/api/agent/conversations/{cid}", headers={"X-WX-OPENID": "openid-2"})
+    forbidden = client.get(f"/api/agent/conversations/{cid}", headers=wx_headers("openid-2"))
     missing = client.get("/api/agent/conversations/nope", headers=OPENID_HEADER)
 
     assert ok.status_code == 200
@@ -194,3 +199,29 @@ def test_report_insights_rejects_unbound_device():
     response = client.get("/api/agent/report-insights/dev-1", headers=OPENID_HEADER)
 
     assert response.status_code == 403
+
+
+def test_chat_rejects_spoofed_openid_without_trusted_source():
+    """公网域名可以随便伪造 X-WX-OPENID；没有平台注入的 X-WX-SOURCE 一律拒绝，
+    否则任何人都能白嫖 agent 并消耗模型额度。"""
+    response = client.post(
+        "/api/agent/chat",
+        json={"message": "hi"},
+        headers={"X-WX-OPENID": "spoofed"},
+    )
+
+    assert response.status_code == 401
+    assert "untrusted" in response.json()["detail"]
+    assert main.agent_runner.calls == []  # 根本没调到模型
+
+
+def test_public_openid_allowed_when_debug_flag_set(monkeypatch):
+    monkeypatch.setenv("JIANWEI_ALLOW_PUBLIC_OPENID", "1")
+
+    response = client.post(
+        "/api/agent/chat",
+        json={"message": "hi"},
+        headers={"X-WX-OPENID": "openid-1"},
+    )
+
+    assert response.status_code == 200

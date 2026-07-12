@@ -299,8 +299,11 @@ def bind_device(
 
 
 @app.get("/api/devices/mine")
-def my_devices(x_wx_openid: str | None = Header(default=None)) -> dict[str, Any]:
-    openid = _require_openid(x_wx_openid)
+def my_devices(
+    x_wx_openid: str | None = Header(default=None),
+    x_wx_source: str | None = Header(default=None),
+) -> dict[str, Any]:
+    openid = _require_openid(x_wx_openid, x_wx_source)
     now = datetime.now(timezone.utc)
 
     devices = []
@@ -372,8 +375,9 @@ AGENT_HISTORY_LIMIT = 20
 async def agent_chat(
     request: AgentChatRequest,
     x_wx_openid: str | None = Header(default=None),
+    x_wx_source: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    openid = _require_openid(x_wx_openid)
+    openid = _require_openid(x_wx_openid, x_wx_source)
     if not agent_runner.available:
         raise HTTPException(status_code=503, detail="助手暂未开通")
 
@@ -408,8 +412,9 @@ async def agent_chat(
 def agent_conversation(
     conversation_id: str,
     x_wx_openid: str | None = Header(default=None),
+    x_wx_source: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    openid = _require_openid(x_wx_openid)
+    openid = _require_openid(x_wx_openid, x_wx_source)
     owner = agent_store.conversation_owner(conversation_id)
     if owner is None:
         raise HTTPException(status_code=404, detail="conversation not found")
@@ -430,8 +435,9 @@ def agent_conversation(
 async def agent_report_insights(
     device_id: str,
     x_wx_openid: str | None = Header(default=None),
+    x_wx_source: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    openid = _require_openid(x_wx_openid)
+    openid = _require_openid(x_wx_openid, x_wx_source)
     if device_id not in device_store.devices_for_user(openid):
         raise HTTPException(status_code=403, detail="device not bound to current user")
 
@@ -493,18 +499,30 @@ def device_alerts(device_id: str, limit: int = 20) -> dict[str, Any]:
 @app.get("/api/alerts/mine")
 def my_alerts(
     x_wx_openid: str | None = Header(default=None),
+    x_wx_source: str | None = Header(default=None),
     limit: int = 20,
 ) -> dict[str, Any]:
-    openid = _require_openid(x_wx_openid)
+    openid = _require_openid(x_wx_openid, x_wx_source)
     device_ids = device_store.devices_for_user(openid)
     alerts = alert_store.recent(device_ids, limit=max(1, min(limit, 100))) if device_ids else []
     return {"alerts": [_public_alert(alert) for alert in alerts]}
 
 
-def _require_openid(x_wx_openid: str | None) -> str:
-    # 云托管 callContainer 会自动注入 X-WX-OPENID；缺失说明不是小程序会话
+def _require_openid(x_wx_openid: str | None, x_wx_source: str | None = None) -> str:
+    """校验请求确实来自微信生态。
+
+    云托管只在 callContainer 链路上注入可信的 X-WX-OPENID 和 X-WX-SOURCE，
+    并会剥离客户端伪造的同名头；公网域名不做任何过滤（官方明确不提供防护），
+    所以没有 X-WX-SOURCE 的请求里 openid 是不可信的，必须拒绝——否则任何人
+    都能伪造 openid 调用 agent 并消耗模型额度。
+    本地调试可设 JIANWEI_ALLOW_PUBLIC_OPENID=1 放行。
+    """
     if not x_wx_openid:
         raise HTTPException(status_code=401, detail="missing openid (call via wx.cloud.callContainer)")
+
+    if not x_wx_source and os.environ.get("JIANWEI_ALLOW_PUBLIC_OPENID") != "1":
+        raise HTTPException(status_code=401, detail="untrusted request source (call via wx.cloud.callContainer)")
+
     return x_wx_openid
 
 

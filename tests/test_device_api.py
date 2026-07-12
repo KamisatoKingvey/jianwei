@@ -10,6 +10,11 @@ from jianwei.storage.sample_store import JsonlSampleStore
 client = TestClient(main.app)
 
 
+def wx_headers(openid):
+    """模拟云托管 callContainer 注入的可信头。"""
+    return {"X-WX-OPENID": openid, "X-WX-SOURCE": "wxcloud"}
+
+
 @pytest.fixture(autouse=True)
 def isolated_stores(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "sample_store", JsonlSampleStore(tmp_path / "samples.jsonl"))
@@ -48,7 +53,7 @@ def test_bind_device_with_openid_header():
     response = client.post(
         "/api/devices/bind",
         json={"bind_code": bind_code},
-        headers={"X-WX-OPENID": "openid-1"},
+        headers=wx_headers("openid-1"),
     )
 
     assert response.status_code == 200
@@ -60,7 +65,7 @@ def test_bind_rejects_unknown_code_and_missing_openid():
     unknown = client.post(
         "/api/devices/bind",
         json={"bind_code": "ZZZZZZ"},
-        headers={"X-WX-OPENID": "openid-1"},
+        headers=wx_headers("openid-1"),
     )
     missing_openid = client.post("/api/devices/bind", json={"bind_code": "ABC123"})
 
@@ -70,7 +75,7 @@ def test_bind_rejects_unknown_code_and_missing_openid():
 
 def test_my_devices_lists_bound_devices_with_latest_sample():
     bind_code = client.post("/api/devices/register", json={"device_id": "jianwei-r60-a01"}).json()["bind_code"]
-    client.post("/api/devices/bind", json={"bind_code": bind_code}, headers={"X-WX-OPENID": "openid-1"})
+    client.post("/api/devices/bind", json={"bind_code": bind_code}, headers=wx_headers("openid-1"))
     client.post(
         "/api/radar/data",
         json={
@@ -83,7 +88,7 @@ def test_my_devices_lists_bound_devices_with_latest_sample():
         },
     )
 
-    response = client.get("/api/devices/mine", headers={"X-WX-OPENID": "openid-1"})
+    response = client.get("/api/devices/mine", headers=wx_headers("openid-1"))
 
     assert response.status_code == 200
     devices = response.json()["devices"]
@@ -103,3 +108,11 @@ def test_device_status_404_without_samples():
     response = client.get("/api/devices/unknown/status")
 
     assert response.status_code == 404
+
+
+def test_my_devices_rejects_spoofed_openid_from_public_network():
+    """公网伪造 X-WX-OPENID 不能读到设备列表（缺少平台注入的 X-WX-SOURCE）。"""
+    response = client.get("/api/devices/mine", headers={"X-WX-OPENID": "spoofed"})
+
+    assert response.status_code == 401
+    assert "untrusted" in response.json()["detail"]
