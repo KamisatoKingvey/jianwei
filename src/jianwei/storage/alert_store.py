@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from jianwei.config import MySqlSettings
-from jianwei.storage.mysql_store import _connect
+from jianwei.storage.mysql_store import _connect, ensure_utc
 
 
 SCHEMA_SQL = """
@@ -98,7 +98,10 @@ class MySqlAlertStore:
                     """,
                     (*device_ids, limit),
                 )
-                return [dict(row) for row in cursor.fetchall()]
+                rows = [dict(row) for row in cursor.fetchall()]
+        for row in rows:
+            row["created_at"] = ensure_utc(row.get("created_at"))
+        return rows
 
     def last_time(self, device_id: str, alert_type: str) -> datetime | None:
         with self._connect(self.settings) as connection:
@@ -113,7 +116,7 @@ class MySqlAlertStore:
                     (device_id, alert_type),
                 )
                 row = cursor.fetchone()
-        return row["last_time"] if row else None
+        return ensure_utc(row["last_time"]) if row else None
 
     def _ensure_schema(self, connection: Any) -> None:
         if self._schema_ready:

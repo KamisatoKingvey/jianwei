@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator
+from datetime import datetime, timezone
 from typing import Any
 
 from jianwei.config import MySqlSettings
 from jianwei.radar.r60abd1 import RadarEvent, event_to_dict
+
+
+def ensure_utc(value: Any) -> Any:
+    """MySQL DATETIME 读出来是 naive；库里存的就是 UTC 墙上时间，补上时区。"""
+    if isinstance(value, datetime) and value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
 
 
 SCHEMA_SQL = """

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from jianwei.config import MySqlSettings
-from jianwei.storage.mysql_store import _connect
+from jianwei.storage.mysql_store import _connect, ensure_utc
 
 
 SAMPLE_FIELDS = (
@@ -144,7 +144,7 @@ class MySqlSampleStore:
             self._ensure_schema(connection)
             with connection.cursor() as cursor:
                 cursor.execute(sql, params)
-                rows = [dict(row) for row in cursor.fetchall()]
+                rows = [_utc_row(dict(row)) for row in cursor.fetchall()]
         return iter(rows)
 
     def latest(self, device_id: str) -> dict[str, Any] | None:
@@ -156,7 +156,7 @@ class MySqlSampleStore:
                     (device_id,),
                 )
                 row = cursor.fetchone()
-        return dict(row) if row else None
+        return _utc_row(dict(row)) if row else None
 
     def count(self, device_id: str | None = None) -> int:
         sql = "SELECT COUNT(*) AS total FROM radar_samples"
@@ -178,6 +178,12 @@ class MySqlSampleStore:
             cursor.execute(SCHEMA_SQL)
         connection.commit()
         self._schema_ready = True
+
+
+def _utc_row(row: dict[str, Any]) -> dict[str, Any]:
+    row["sampled_at"] = ensure_utc(row.get("sampled_at"))
+    row["clock_synced"] = bool(row.get("clock_synced", True))
+    return row
 
 
 def _encode(row: dict[str, Any]) -> dict[str, Any]:
