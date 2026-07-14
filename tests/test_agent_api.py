@@ -74,13 +74,25 @@ def seed_device_with_night(device_id="dev-1", openid="openid-1"):
     )
 
 
-def test_chat_returns_reply_with_disclaimer_and_stores_messages():
+def poll_task(task_id, headers=OPENID_HEADER):
+    """TestClient 会在响应返回前跑完 BackgroundTasks，轮询一次即可拿到终态。"""
+    response = client.get(f"/api/agent/chat/tasks/{task_id}", headers=headers)
+    return response
+
+
+def test_chat_returns_pending_task_then_reply_with_disclaimer():
     response = client.post("/api/agent/chat", json={"message": "我昨晚睡得怎么样"}, headers=OPENID_HEADER)
 
     assert response.status_code == 200
     body = response.json()
-    assert body["reply"].endswith(DISCLAIMER)
+    assert body["status"] == "pending"
+    assert body["task_id"]
     assert body["conversation_id"]
+
+    task = poll_task(body["task_id"]).json()
+    assert task["status"] == "done"
+    assert task["reply"].endswith(DISCLAIMER)
+    assert task["conversation_id"] == body["conversation_id"]
 
     stored = main.agent_store.recent_messages(body["conversation_id"])
     assert [row["role"] for row in stored] == ["user", "assistant"]
@@ -115,12 +127,37 @@ def test_chat_503_when_agent_not_configured(monkeypatch):
     assert response.status_code == 503
 
 
-def test_chat_502_when_agent_errors(monkeypatch):
+def test_chat_task_fails_gracefully_when_agent_errors(monkeypatch):
     monkeypatch.setattr(main, "agent_runner", FakeRunner(error=RuntimeError("boom")))
 
     response = client.post("/api/agent/chat", json={"message": "hi"}, headers=OPENID_HEADER)
+    assert response.status_code == 200
 
-    assert response.status_code == 502
+    task = poll_task(response.json()["task_id"]).json()
+    assert task["status"] == "failed"
+    assert task["error"]
+
+
+def test_chat_task_polling_enforces_ownership_and_missing():
+    created = client.post("/api/agent/chat", json={"message": "hi"}, headers=OPENID_HEADER).json()
+
+    forbidden = poll_task(created["task_id"], headers=wx_headers("openid-2"))
+    missing = poll_task("nope")
+
+    assert forbidden.status_code == 403
+    assert missing.status_code == 404
+
+
+def test_chat_task_pending_too_long_reports_timeout(monkeypatch):
+    """实例被回收会留下永远 pending 的任务，超时后轮询应返回失败而不是让前端干等。"""
+    created = client.post("/api/agent/chat", json={"message": "hi"}, headers=OPENID_HEADER).json()
+    stale = datetime.now(timezone.utc) - timedelta(seconds=600)
+    main.agent_store.create_task("stale-task", "openid-1", created["conversation_id"], "hi", stale)
+
+    task = poll_task("stale-task").json()
+
+    assert task["status"] == "failed"
+    assert "超时" in task["error"]
 
 
 def test_chat_rejects_foreign_conversation():
@@ -159,16 +196,17 @@ def test_conversation_history_endpoint_enforces_ownership():
     assert missing.status_code == 404
 
 
-def test_report_insights_generates_once_then_caches():
+def test_report_insights_returns_rules_first_then_cached_agent():
+    """未缓存时立即返回规则版摘要（15 秒内响应），agent 版后台生成进缓存。"""
     seed_device_with_night()
 
     first = client.get("/api/agent/report-insights/dev-1", headers=OPENID_HEADER)
     second = client.get("/api/agent/report-insights/dev-1", headers=OPENID_HEADER)
 
     assert first.status_code == 200
-    assert first.json()["source"] == "agent"
-    assert second.json()["insights"] == first.json()["insights"]
-    assert len(main.agent_runner.calls) == 1  # 第二次走缓存
+    assert first.json()["source"] == "rules"
+    assert second.json()["source"] == "agent"
+    assert len(main.agent_runner.calls) == 1  # 后台只生成一次，之后走缓存
 
 
 def test_report_insights_falls_back_to_rules_when_agent_down(monkeypatch):

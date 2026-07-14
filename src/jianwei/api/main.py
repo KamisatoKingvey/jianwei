@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -371,9 +371,15 @@ class AgentChatRequest(BaseModel):
 AGENT_HISTORY_LIMIT = 20
 
 
+# callContainer 网关 15 秒硬超时（官方不可调），而 agent 一次多轮推理往往超过
+# 15 秒，所以 chat 必须异步化：POST 立即返回 task_id，前端轮询任务结果。
+AGENT_TASK_PENDING_TIMEOUT = timedelta(seconds=180)
+
+
 @app.post("/api/agent/chat")
 async def agent_chat(
     request: AgentChatRequest,
+    background_tasks: BackgroundTasks,
     x_wx_openid: str | None = Header(default=None),
     x_wx_source: str | None = Header(default=None),
 ) -> dict[str, Any]:
@@ -389,23 +395,60 @@ async def agent_chat(
         if owner is not None and owner != openid:
             raise HTTPException(status_code=403, detail="conversation belongs to another user")
 
-    history = agent_store.recent_messages(conversation_id, limit=AGENT_HISTORY_LIMIT)
-    prompt = build_chat_prompt(history, request.message)
+    task_id = uuid.uuid4().hex
+    agent_store.create_task(task_id, openid, conversation_id, request.message, datetime.now(timezone.utc))
+    background_tasks.add_task(_execute_chat_task, task_id, openid, conversation_id, request.message)
 
+    return {"conversation_id": conversation_id, "task_id": task_id, "status": "pending"}
+
+
+async def _execute_chat_task(task_id: str, openid: str, conversation_id: str, message: str) -> None:
     try:
+        history = agent_store.recent_messages(conversation_id, limit=AGENT_HISTORY_LIMIT)
+        prompt = build_chat_prompt(history, message)
         reply = await agent_runner.run(prompt, _agent_context(openid))
     except AgentUnavailable:
-        raise HTTPException(status_code=503, detail="助手暂未开通")
+        agent_store.finish_task(task_id, "failed", datetime.now(timezone.utc), error="助手暂未开通")
+        return
     except Exception:
-        logger.exception("agent chat failed for %s", openid)
-        raise HTTPException(status_code=502, detail="助手暂时不可用，请稍后再试")
+        logger.exception("agent chat task %s failed for %s", task_id, openid)
+        agent_store.finish_task(task_id, "failed", datetime.now(timezone.utc), error="助手暂时不可用，请稍后再试")
+        return
 
     reply = f"{reply}\n\n{DISCLAIMER}"
     now = datetime.now(timezone.utc)
-    agent_store.append_message(conversation_id, openid, "user", request.message, now)
+    agent_store.append_message(conversation_id, openid, "user", message, now)
     agent_store.append_message(conversation_id, openid, "assistant", reply, now)
+    agent_store.finish_task(task_id, "done", now, reply=reply)
 
-    return {"conversation_id": conversation_id, "reply": reply}
+
+@app.get("/api/agent/chat/tasks/{task_id}")
+def agent_chat_task(
+    task_id: str,
+    x_wx_openid: str | None = Header(default=None),
+    x_wx_source: str | None = Header(default=None),
+) -> dict[str, Any]:
+    openid = _require_openid(x_wx_openid, x_wx_source)
+    task = agent_store.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task["openid"] != openid:
+        raise HTTPException(status_code=403, detail="task belongs to another user")
+
+    status = task["status"]
+    error = task.get("error")
+    # 实例被回收会留下永远 pending 的任务，超过时限直接按失败上报
+    if status == "pending" and datetime.now(timezone.utc) - task["created_at"] > AGENT_TASK_PENDING_TIMEOUT:
+        status = "failed"
+        error = "助手响应超时，请稍后再试"
+
+    return {
+        "task_id": task_id,
+        "conversation_id": task["conversation_id"],
+        "status": status,
+        "reply": task.get("reply") or "",
+        "error": error or "",
+    }
 
 
 @app.get("/api/agent/conversations/{conversation_id}")
@@ -431,9 +474,14 @@ def agent_conversation(
     }
 
 
+# 防止缓存生成完成前反复进入仪表盘触发重复的 agent 调用（单实例内去重即可）
+_insights_in_flight: set[str] = set()
+
+
 @app.get("/api/agent/report-insights/{device_id}")
 async def agent_report_insights(
     device_id: str,
+    background_tasks: BackgroundTasks,
     x_wx_openid: str | None = Header(default=None),
     x_wx_source: str | None = Header(default=None),
 ) -> dict[str, Any]:
@@ -454,19 +502,27 @@ async def agent_report_insights(
     if cached:
         return {"device_id": device_id, "session_id": session_id, "source": "agent", "insights": cached}
 
-    if not agent_runner.available:
-        return {"device_id": device_id, "session_id": session_id, "source": "rules", "insights": report["summary"]}
+    # agent 生成可能超过 callContainer 的 15 秒硬超时：先返回规则版摘要，
+    # 后台生成 agent 解读写入缓存，下次进入页面自然升级成 agent 版。
+    key = f"{device_id}:{session_id}"
+    if agent_runner.available and key not in _insights_in_flight:
+        _insights_in_flight.add(key)
+        background_tasks.add_task(_generate_report_insight, openid, device_id, session_id)
 
+    return {"device_id": device_id, "session_id": session_id, "source": "rules", "insights": report["summary"]}
+
+
+async def _generate_report_insight(openid: str, device_id: str, session_id: str) -> None:
     try:
         insights = await agent_runner.run(
             REPORT_INSIGHTS_PROMPT.format(device_id=device_id),
             _agent_context(openid),
         )
         agent_store.put_insight(device_id, session_id, insights)
-        return {"device_id": device_id, "session_id": session_id, "source": "agent", "insights": insights}
     except Exception:
         logger.exception("agent insights failed for %s", device_id)
-        return {"device_id": device_id, "session_id": session_id, "source": "rules", "insights": report["summary"]}
+    finally:
+        _insights_in_flight.discard(f"{device_id}:{session_id}")
 
 
 def _agent_context(openid: str) -> AgentContext:

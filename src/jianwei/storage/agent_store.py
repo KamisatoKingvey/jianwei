@@ -34,6 +34,22 @@ CREATE TABLE IF NOT EXISTS agent_insights (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
 
+# callContainer 网关 15 秒硬超时，chat 改为「提交任务 + 轮询」，任务状态
+# 必须落库（而不是进程内存），因为轮询请求可能打到另一个云托管实例。
+TASKS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS agent_tasks (
+  task_id VARCHAR(64) NOT NULL PRIMARY KEY,
+  openid VARCHAR(128) NOT NULL,
+  conversation_id VARCHAR(64) NOT NULL,
+  message TEXT NOT NULL,
+  status VARCHAR(16) NOT NULL,
+  reply MEDIUMTEXT NULL,
+  error VARCHAR(255) NULL,
+  created_at DATETIME NOT NULL,
+  updated_at DATETIME NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
+
 
 class JsonlAgentStore:
     """本地 JSONL：对话消息 + 晨报解读缓存。"""
@@ -41,6 +57,7 @@ class JsonlAgentStore:
     def __init__(self, messages_path: Path, insights_path: Path):
         self.messages_path = messages_path
         self.insights_path = insights_path
+        self.tasks_path = messages_path.with_name("agent_tasks.jsonl")
         self.messages_path.parent.mkdir(parents=True, exist_ok=True)
 
     def append_message(self, conversation_id: str, openid: str, role: str, content: str, created_at: datetime) -> None:
@@ -85,6 +102,63 @@ class JsonlAgentStore:
     def put_insight(self, device_id: str, session_id: str, insights: str) -> None:
         row = {"device_id": device_id, "session_id": session_id, "insights": insights}
         with self.insights_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    def create_task(self, task_id: str, openid: str, conversation_id: str, message: str, created_at: datetime) -> None:
+        self._append_task_event(
+            {
+                "task_id": task_id,
+                "openid": openid,
+                "conversation_id": conversation_id,
+                "message": message,
+                "status": "pending",
+                "reply": None,
+                "error": None,
+                "created_at": created_at.isoformat(),
+                "updated_at": created_at.isoformat(),
+            }
+        )
+
+    def finish_task(
+        self,
+        task_id: str,
+        status: str,
+        updated_at: datetime,
+        reply: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        self._append_task_event(
+            {
+                "task_id": task_id,
+                "status": status,
+                "reply": reply,
+                "error": error,
+                "updated_at": updated_at.isoformat(),
+            }
+        )
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        if not self.tasks_path.exists():
+            return None
+        merged: dict[str, Any] | None = None
+        with self.tasks_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                if row.get("task_id") != task_id:
+                    continue
+                merged = {**merged, **row} if merged else row
+        if merged is None:
+            return None
+        for key in ("created_at", "updated_at"):
+            if isinstance(merged.get(key), str):
+                merged[key] = datetime.fromisoformat(merged[key])
+        return merged
+
+    def _append_task_event(self, row: dict[str, Any]) -> None:
+        with self.tasks_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     def _scan_messages(self) -> Iterator[dict[str, Any]]:
@@ -188,11 +262,67 @@ class MySqlAgentStore:
                 )
             connection.commit()
 
+    def create_task(self, task_id: str, openid: str, conversation_id: str, message: str, created_at: datetime) -> None:
+        with self._connect(self.settings) as connection:
+            self._ensure_schema(connection)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO agent_tasks
+                      (task_id, openid, conversation_id, message, status, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, 'pending', %s, %s)
+                    """,
+                    (task_id, openid, conversation_id, message, created_at, created_at),
+                )
+            connection.commit()
+
+    def finish_task(
+        self,
+        task_id: str,
+        status: str,
+        updated_at: datetime,
+        reply: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        with self._connect(self.settings) as connection:
+            self._ensure_schema(connection)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE agent_tasks
+                    SET status = %s, reply = %s, error = %s, updated_at = %s
+                    WHERE task_id = %s
+                    """,
+                    (status, reply, error, updated_at, task_id),
+                )
+            connection.commit()
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        with self._connect(self.settings) as connection:
+            self._ensure_schema(connection)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT task_id, openid, conversation_id, message, status, reply, error,
+                           created_at, updated_at
+                    FROM agent_tasks WHERE task_id = %s
+                    """,
+                    (task_id,),
+                )
+                row = cursor.fetchone()
+        if not row:
+            return None
+        task = dict(row)
+        task["created_at"] = ensure_utc(task.get("created_at"))
+        task["updated_at"] = ensure_utc(task.get("updated_at"))
+        return task
+
     def _ensure_schema(self, connection: Any) -> None:
         if self._schema_ready:
             return
         with connection.cursor() as cursor:
             cursor.execute(MESSAGES_SCHEMA_SQL)
             cursor.execute(INSIGHTS_SCHEMA_SQL)
+            cursor.execute(TASKS_SCHEMA_SQL)
         connection.commit()
         self._schema_ready = True
