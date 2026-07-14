@@ -11,7 +11,7 @@ from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from jianwei.agent.prompts import DISCLAIMER, REPORT_INSIGHTS_PROMPT, build_chat_prompt
+from jianwei.agent.prompts import REPORT_INSIGHTS_PROMPT, build_chat_prompt
 from jianwei.agent.runner import AgentUnavailable, ClaudeAgentRunner
 from jianwei.agent.tools import AgentContext
 from jianwei.alerts.rules import detect_alerts
@@ -42,7 +42,7 @@ STATIC_PATH = ROOT / "static"
 
 load_env_file(ROOT / ".env")
 
-app = FastAPI(title="Jianwei Backend", version="0.3.0")
+app = FastAPI(title="Jianwei Backend", version="0.3.1")
 store = build_event_store(DATA_PATH)
 sample_store = build_sample_store(SAMPLES_PATH)
 device_store = build_device_store(DEVICES_PATH)
@@ -108,6 +108,7 @@ def health() -> dict:
     return {
         "status": "ok",
         "service": "jianwei-backend",
+        "version": app.version,
         "storage": _storage_health(),
         "agent": agent_runner.diagnostics(),
     }
@@ -416,7 +417,7 @@ async def _execute_chat_task(task_id: str, openid: str, conversation_id: str, me
         agent_store.finish_task(task_id, "failed", datetime.now(timezone.utc), error="助手暂时不可用，请稍后再试")
         return
 
-    reply = f"{reply}\n\n{DISCLAIMER}"
+    # 免责声明由小程序在输入框下方固定展示，不再拼进每条回复
     now = datetime.now(timezone.utc)
     agent_store.append_message(conversation_id, openid, "user", message, now)
     agent_store.append_message(conversation_id, openid, "assistant", reply, now)

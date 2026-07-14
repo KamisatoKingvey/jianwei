@@ -3,7 +3,6 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
-from jianwei.agent.prompts import DISCLAIMER
 from jianwei.api import main
 from jianwei.storage.agent_store import JsonlAgentStore
 from jianwei.storage.alert_store import JsonlAlertStore
@@ -80,7 +79,7 @@ def poll_task(task_id, headers=OPENID_HEADER):
     return response
 
 
-def test_chat_returns_pending_task_then_reply_with_disclaimer():
+def test_chat_returns_pending_task_then_plain_reply():
     response = client.post("/api/agent/chat", json={"message": "我昨晚睡得怎么样"}, headers=OPENID_HEADER)
 
     assert response.status_code == 200
@@ -91,7 +90,8 @@ def test_chat_returns_pending_task_then_reply_with_disclaimer():
 
     task = poll_task(body["task_id"]).json()
     assert task["status"] == "done"
-    assert task["reply"].endswith(DISCLAIMER)
+    # 免责声明改由小程序输入框下方固定展示，回复本体不再拼接
+    assert task["reply"] == "你昨晚睡得不错。"
     assert task["conversation_id"] == body["conversation_id"]
 
     stored = main.agent_store.recent_messages(body["conversation_id"])
