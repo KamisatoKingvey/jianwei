@@ -109,6 +109,7 @@ def health() -> dict:
         "status": "ok",
         "service": "jianwei-backend",
         "storage": _storage_health(),
+        "agent": agent_runner.diagnostics(),
     }
 
 

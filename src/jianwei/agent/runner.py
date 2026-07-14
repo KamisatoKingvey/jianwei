@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+from pathlib import Path
 from typing import Any
 
 from jianwei.agent import tools as agent_tools
@@ -47,15 +49,48 @@ class ClaudeAgentRunner:
         self.model = os.environ.get("LLM_MODEL", DEFAULT_MODEL)
         self.max_turns = int(os.environ.get("JIANWEI_AGENT_MAX_TURNS", DEFAULT_MAX_TURNS))
         self._sdk = _import_sdk()
+        self.last_error: str | None = None
 
     @property
     def available(self) -> bool:
         return bool(self.api_key) and self._sdk is not None
 
+    def cli_found(self) -> bool:
+        """SDK 平台 wheel 自带 CLI 二进制；装到 sdist 时没有，运行时才会炸。"""
+        if self._sdk is None:
+            return False
+        import claude_agent_sdk
+
+        bundled = Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
+        return bundled.is_file() or shutil.which("claude") is not None
+
+    def diagnostics(self) -> dict[str, Any]:
+        """暴露到 /health 的自检信息，线上排障用（不含密钥）。"""
+        info: dict[str, Any] = {
+            "sdk_installed": self._sdk is not None,
+            "api_key_configured": bool(self.api_key),
+            "cli_found": self.cli_found(),
+            "model": self.model,
+        }
+        if self.last_error:
+            # 默认只暴露异常类型；设 JIANWEI_DEBUG=1 才带详细信息
+            if os.environ.get("JIANWEI_DEBUG") == "1":
+                info["last_error"] = self.last_error[:500]
+            else:
+                info["last_error"] = self.last_error.split(":", 1)[0]
+        return info
+
     async def run(self, prompt: str, context: agent_tools.AgentContext) -> str:
         if not self.available:
             raise AgentUnavailable("agent is not configured")
 
+        try:
+            return await self._run(prompt, context)
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            raise
+
+    async def _run(self, prompt: str, context: agent_tools.AgentContext) -> str:
         sdk = self._sdk
         agent_tools.set_context(context)
         options = self._build_options(sdk)
@@ -73,6 +108,7 @@ class ClaudeAgentRunner:
         reply = (result_text or "".join(final_text)).strip()
         if not reply:
             raise RuntimeError("agent returned empty reply")
+        self.last_error = None
         return reply
 
     def _build_options(self, sdk: dict[str, Any]) -> Any:
