@@ -38,6 +38,19 @@ def generate_bind_code() -> str:
     return secrets.token_hex(3).upper()
 
 
+class BindCodeConflictError(ValueError):
+    """指定的绑定码已经登记在其他设备上。"""
+
+    def __init__(self, bind_code: str):
+        super().__init__(f"bind code {bind_code} already used by another device")
+        self.bind_code = bind_code
+
+
+def _normalize_bind_code(bind_code: str | None) -> str | None:
+    normalized = (bind_code or "").strip().upper()
+    return normalized or None
+
+
 class JsonDeviceStore:
     """本地 JSON 文件的设备注册表 + 用户绑定关系。"""
 
@@ -45,21 +58,39 @@ class JsonDeviceStore:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-    def upsert_device(self, device_id: str, secret: str | None = None) -> dict[str, Any]:
+    def upsert_device(
+        self,
+        device_id: str,
+        secret: str | None = None,
+        bind_code: str | None = None,
+    ) -> dict[str, Any]:
         data = self._load()
+        requested_code = _normalize_bind_code(bind_code)
+        if requested_code:
+            for other in data["devices"].values():
+                if other["bind_code"] == requested_code and other["device_id"] != device_id:
+                    raise BindCodeConflictError(requested_code)
+
         device = data["devices"].get(device_id)
         if device is None:
             device = {
                 "device_id": device_id,
                 "secret": secret,
-                "bind_code": self._unique_bind_code(data),
+                "bind_code": requested_code or self._unique_bind_code(data),
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
             data["devices"][device_id] = device
             self._save(data)
-        elif secret is not None and device.get("secret") != secret:
-            device["secret"] = secret
-            self._save(data)
+        else:
+            changed = False
+            if secret is not None and device.get("secret") != secret:
+                device["secret"] = secret
+                changed = True
+            if requested_code and device["bind_code"] != requested_code:
+                device["bind_code"] = requested_code
+                changed = True
+            if changed:
+                self._save(data)
         return dict(device)
 
     def get_device(self, device_id: str) -> dict[str, Any] | None:
@@ -118,29 +149,50 @@ class MySqlDeviceStore:
         self._connect = connect or _connect
         self._schema_ready = False
 
-    def upsert_device(self, device_id: str, secret: str | None = None) -> dict[str, Any]:
+    def upsert_device(
+        self,
+        device_id: str,
+        secret: str | None = None,
+        bind_code: str | None = None,
+    ) -> dict[str, Any]:
+        requested_code = _normalize_bind_code(bind_code)
         with self._connect(self.settings) as connection:
             self._ensure_schema(connection)
             with connection.cursor() as cursor:
+                if requested_code:
+                    cursor.execute(
+                        "SELECT device_id FROM devices WHERE bind_code = %s",
+                        (requested_code,),
+                    )
+                    owner = cursor.fetchone()
+                    if owner and owner["device_id"] != device_id:
+                        raise BindCodeConflictError(requested_code)
+
                 cursor.execute("SELECT * FROM devices WHERE device_id = %s", (device_id,))
                 row = cursor.fetchone()
                 if row is None:
-                    bind_code = generate_bind_code()
                     cursor.execute(
                         "INSERT INTO devices (device_id, secret, bind_code) VALUES (%s, %s, %s)",
-                        (device_id, secret, bind_code),
+                        (device_id, secret, requested_code or generate_bind_code()),
                     )
                     connection.commit()
                     cursor.execute("SELECT * FROM devices WHERE device_id = %s", (device_id,))
                     row = cursor.fetchone()
-                elif secret is not None and row.get("secret") != secret:
-                    cursor.execute(
-                        "UPDATE devices SET secret = %s WHERE device_id = %s",
-                        (secret, device_id),
-                    )
-                    connection.commit()
-                    row = dict(row)
-                    row["secret"] = secret
+                else:
+                    updates = {}
+                    if secret is not None and row.get("secret") != secret:
+                        updates["secret"] = secret
+                    if requested_code and row.get("bind_code") != requested_code:
+                        updates["bind_code"] = requested_code
+                    if updates:
+                        assignments = ", ".join(f"{column} = %s" for column in updates)
+                        cursor.execute(
+                            f"UPDATE devices SET {assignments} WHERE device_id = %s",
+                            (*updates.values(), device_id),
+                        )
+                        connection.commit()
+                        row = dict(row)
+                        row.update(updates)
         return dict(row)
 
     def get_device(self, device_id: str) -> dict[str, Any] | None:

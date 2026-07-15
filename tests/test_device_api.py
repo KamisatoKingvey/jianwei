@@ -32,6 +32,48 @@ def test_register_device_returns_bind_code():
     assert body["has_secret"] is False
 
 
+def test_register_device_accepts_label_bind_code():
+    """产线登记：绑定码用设备标签上的码，而不是随机生成。"""
+    response = client.post(
+        "/api/devices/register",
+        json={"device_id": "dev-1", "bind_code": "ab12cd"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["bind_code"] == "AB12CD"
+
+    bind = client.post(
+        "/api/devices/bind",
+        json={"bind_code": "AB12CD"},
+        headers=wx_headers("openid-1"),
+    )
+    assert bind.status_code == 200
+    assert bind.json()["device_id"] == "dev-1"
+
+
+def test_register_updates_bind_code_for_existing_device():
+    """设备先上报自动注册（随机码），补登记标签码后以标签码为准。"""
+    first = client.post("/api/devices/register", json={"device_id": "dev-1"})
+    assert first.json()["bind_code"] != "AB12CD"
+
+    second = client.post(
+        "/api/devices/register",
+        json={"device_id": "dev-1", "bind_code": "AB12CD"},
+    )
+    assert second.json()["bind_code"] == "AB12CD"
+
+
+def test_register_rejects_bind_code_used_by_another_device():
+    client.post("/api/devices/register", json={"device_id": "dev-1", "bind_code": "AB12CD"})
+
+    conflict = client.post(
+        "/api/devices/register",
+        json={"device_id": "dev-2", "bind_code": "AB12CD"},
+    )
+
+    assert conflict.status_code == 409
+
+
 def test_register_requires_admin_key_when_configured(monkeypatch):
     monkeypatch.setenv("JIANWEI_ADMIN_KEY", "adm1n")
 

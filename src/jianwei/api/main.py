@@ -22,6 +22,7 @@ from jianwei.config import load_env_file
 from jianwei.notify.wechat import send_alert_notifications
 from jianwei.radar.r60abd1 import event_from_dict, events_from_hex_log
 from jianwei.radar.simulator import generate_demo_events
+from jianwei.storage.device_store import BindCodeConflictError
 from jianwei.storage.factory import (
     build_agent_store,
     build_alert_store,
@@ -93,6 +94,8 @@ class RadarSampleIn(BaseModel):
 class RegisterDeviceRequest(BaseModel):
     device_id: str = Field(min_length=1)
     secret: str | None = None
+    # 可选：指定绑定码（与设备标签一致）；缺省时由后端随机生成
+    bind_code: str | None = Field(default=None, min_length=4, max_length=32)
 
 
 class BindDeviceRequest(BaseModel):
@@ -275,7 +278,14 @@ def register_device(
     if admin_key and x_admin_key != admin_key:
         raise HTTPException(status_code=401, detail="invalid admin key")
 
-    device = device_store.upsert_device(request.device_id, secret=request.secret)
+    try:
+        device = device_store.upsert_device(
+            request.device_id,
+            secret=request.secret,
+            bind_code=request.bind_code,
+        )
+    except BindCodeConflictError:
+        raise HTTPException(status_code=409, detail="bind code already used by another device")
     return {
         "device_id": device["device_id"],
         "bind_code": device["bind_code"],
