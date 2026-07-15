@@ -25,6 +25,13 @@ SAMPLE_FIELDS = (
     "humidity",
 )
 
+# 波形字段：每行存一个 int 列表（该秒的原始波形增量），
+# MySQL 里以 JSON 文本落库，读回时解码回列表。与标量 SAMPLE_FIELDS 分开处理。
+WAVEFORM_FIELDS = (
+    "respiration_waveform",
+    "heart_waveform",
+)
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS radar_samples (
   id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -43,10 +50,19 @@ CREATE TABLE IF NOT EXISTS radar_samples (
   co2 INT NULL,
   temperature DOUBLE NULL,
   humidity DOUBLE NULL,
+  respiration_waveform TEXT NULL,
+  heart_waveform TEXT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_radar_samples_device_time (device_id, sampled_at, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
+
+# 兼容已部署的旧表：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，
+# 这里逐列检查 information_schema 后按需 ALTER，幂等且不依赖 MySQL 版本。
+WAVEFORM_COLUMN_DDL = {
+    "respiration_waveform": "ALTER TABLE radar_samples ADD COLUMN respiration_waveform TEXT NULL",
+    "heart_waveform": "ALTER TABLE radar_samples ADD COLUMN heart_waveform TEXT NULL",
+}
 
 
 class JsonlSampleStore:
@@ -110,20 +126,26 @@ class MySqlSampleStore:
     def append_many(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
             return
-        columns = ["device_id", "sampled_at", "clock_synced", *SAMPLE_FIELDS]
+        columns = ["device_id", "sampled_at", "clock_synced", *SAMPLE_FIELDS, *WAVEFORM_FIELDS]
         placeholders = ", ".join(["%s"] * len(columns))
         sql = f"INSERT INTO radar_samples ({', '.join(columns)}) VALUES ({placeholders})"
         with self._connect(self.settings) as connection:
             self._ensure_schema(connection)
             with connection.cursor() as cursor:
-                cursor.executemany(
-                    sql,
-                    [
-                        tuple(row.get(column) if column != "clock_synced" else int(bool(row.get(column, True))) for column in columns)
-                        for row in rows
-                    ],
-                )
+                cursor.executemany(sql, [self._insert_values(row, columns) for row in rows])
             connection.commit()
+
+    @staticmethod
+    def _insert_values(row: dict[str, Any], columns: list[str]) -> tuple:
+        values: list[Any] = []
+        for column in columns:
+            if column == "clock_synced":
+                values.append(int(bool(row.get(column, True))))
+            elif column in WAVEFORM_FIELDS:
+                values.append(_encode_waveform(row.get(column)))
+            else:
+                values.append(row.get(column))
+        return tuple(values)
 
     def iter_device(
         self,
@@ -176,13 +198,24 @@ class MySqlSampleStore:
             return
         with connection.cursor() as cursor:
             cursor.execute(SCHEMA_SQL)
+            self._ensure_waveform_columns(cursor)
         connection.commit()
         self._schema_ready = True
+
+    @staticmethod
+    def _ensure_waveform_columns(cursor: Any) -> None:
+        for column, ddl in WAVEFORM_COLUMN_DDL.items():
+            # SHOW COLUMNS ... LIKE 有行即列已存在（新建表已含这些列），无行才补 ALTER
+            cursor.execute("SHOW COLUMNS FROM radar_samples LIKE %s", (column,))
+            if cursor.fetchone() is None:
+                cursor.execute(ddl)
 
 
 def _utc_row(row: dict[str, Any]) -> dict[str, Any]:
     row["sampled_at"] = ensure_utc(row.get("sampled_at"))
     row["clock_synced"] = bool(row.get("clock_synced", True))
+    for field in WAVEFORM_FIELDS:
+        row[field] = _decode_waveform(row.get(field))
     return row
 
 
@@ -196,4 +229,27 @@ def _encode(row: dict[str, Any]) -> dict[str, Any]:
 def _decode(row: dict[str, Any]) -> dict[str, Any]:
     if isinstance(row.get("sampled_at"), str):
         row["sampled_at"] = datetime.fromisoformat(row["sampled_at"])
+    for field in WAVEFORM_FIELDS:
+        if field in row:
+            row[field] = _decode_waveform(row.get(field))
     return row
+
+
+def _encode_waveform(value: Any) -> str | None:
+    """把波形列表编码成落库的 JSON 文本；空/缺省存 NULL 省空间。"""
+    if not value:
+        return None
+    return json.dumps([int(sample) for sample in value], separators=(",", ":"))
+
+
+def _decode_waveform(value: Any) -> list[int]:
+    """把落库的波形还原成 int 列表；兼容 JSON 文本、已解析列表、NULL。"""
+    if value is None or value == "":
+        return []
+    if isinstance(value, list):
+        return [int(sample) for sample in value]
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return []
+    return [int(sample) for sample in parsed] if isinstance(parsed, list) else []

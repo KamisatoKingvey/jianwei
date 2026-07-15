@@ -89,6 +89,10 @@ class RadarSampleIn(BaseModel):
     co2: int = 0
     temperature: float = 0.0
     humidity: float = 0.0
+    # R60ABD1 原始波形增量：每秒约 5 个样本/通道，5Hz、int8 居中（raw-128）。
+    # 固件按秒随聚合值一起上报，是分期/呼吸事件等高级算法的输入。
+    respiration_waveform: list[int] | None = None
+    heart_waveform: list[int] | None = None
 
 
 class RegisterDeviceRequest(BaseModel):
@@ -247,6 +251,8 @@ def _normalize_samples(
                 "co2": item.co2,
                 "temperature": item.temperature,
                 "humidity": item.humidity,
+                "respiration_waveform": list(item.respiration_waveform or []),
+                "heart_waveform": list(item.heart_waveform or []),
             }
         )
     return rows

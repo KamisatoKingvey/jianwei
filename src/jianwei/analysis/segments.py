@@ -6,6 +6,7 @@ from typing import Any
 
 from jianwei.analysis.report import build_sleep_report
 from jianwei.analysis.session import build_session
+from jianwei.analysis.waveform import analyze_respiration
 from jianwei.radar.r60abd1 import RadarEvent
 
 
@@ -50,6 +51,8 @@ def session_report(device_id: str, samples: list[dict[str, Any]]) -> dict[str, A
     report["sample_count"] = len(samples)
     report["environment"] = _environment_summary(samples)
     report["device_sleep"] = _device_sleep_summary(samples)
+    # 波形分析（呼吸节律变异性 + 呼吸事件筛查）；波形不足时为 None，前端需容错
+    report["respiration_analysis"] = analyze_respiration(samples)
     return report
 
 

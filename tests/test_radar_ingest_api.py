@@ -57,6 +57,31 @@ def test_single_data_endpoint_stores_sample():
     assert stored["sampled_at"] == datetime.fromtimestamp(1783698174, tz=timezone.utc)
 
 
+def test_firmware_waveform_fields_are_stored_and_read_back():
+    """固件按秒上报 respiration_waveform/heart_waveform，后端需落库且原样读回。"""
+    sample = make_sample(
+        respiration_waveform=[-3, 1, 4, 2, -1],
+        heart_waveform=[10, -12, 7, 0, -5],
+    )
+
+    response = client.post("/api/radar/data", json=sample)
+    assert response.status_code == 200
+
+    stored = main.sample_store.latest("jianwei-r60-a01")
+    assert stored["respiration_waveform"] == [-3, 1, 4, 2, -1]
+    assert stored["heart_waveform"] == [10, -12, 7, 0, -5]
+
+
+def test_samples_without_waveforms_default_to_empty_lists():
+    """老固件/缺省不带波形时不应报错，读回为空列表。"""
+    response = client.post("/api/radar/data", json=make_sample())
+    assert response.status_code == 200
+
+    stored = main.sample_store.latest("jianwei-r60-a01")
+    assert stored["respiration_waveform"] == []
+    assert stored["heart_waveform"] == []
+
+
 def test_batch_endpoint_stores_all_samples():
     batch = [
         make_sample(timestamp=1783698174000),
