@@ -94,8 +94,8 @@ class RadarSampleIn(BaseModel):
 class RegisterDeviceRequest(BaseModel):
     device_id: str = Field(min_length=1)
     secret: str | None = None
-    # 可选：指定绑定码（与设备标签一致）；缺省时由后端随机生成
-    bind_code: str | None = Field(default=None, min_length=4, max_length=32)
+    # 可选：指定绑定码（与设备标签一致，6 位字母/数字）；缺省时由后端随机生成
+    bind_code: str | None = Field(default=None, pattern=r"^[A-Za-z0-9]{6}$")
 
 
 class BindDeviceRequest(BaseModel):

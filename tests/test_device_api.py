@@ -63,6 +63,20 @@ def test_register_updates_bind_code_for_existing_device():
     assert second.json()["bind_code"] == "AB12CD"
 
 
+def test_register_rejects_malformed_bind_code():
+    too_short = client.post(
+        "/api/devices/register",
+        json={"device_id": "dev-1", "bind_code": "AB12"},
+    )
+    bad_chars = client.post(
+        "/api/devices/register",
+        json={"device_id": "dev-1", "bind_code": "AB-12!"},
+    )
+
+    assert too_short.status_code == 422
+    assert bad_chars.status_code == 422
+
+
 def test_register_rejects_bind_code_used_by_another_device():
     client.post("/api/devices/register", json={"device_id": "dev-1", "bind_code": "AB12CD"})
 
